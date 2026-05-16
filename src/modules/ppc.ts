@@ -1,0 +1,380 @@
+// 3dppc 格式处理：负责序列化/反序列化自定义 3dppc 文件，提供加载与下载工具。
+import { BufferGeometry, Float32BufferAttribute, Group, Mesh } from "three";
+import { collectGeometry, type PPCGeometry } from "./geometry";
+import { getCurrentProject } from "./project";
+import { getGroupColorCursor, exportGroupsData } from "./groups";
+import { getSettings } from "./settings";
+import { exportEdgeJoinTypes } from "./model";
+import { getTexturesForExport, normalizeTextureMetadata, type TextureData } from "./textureManager";
+
+// 贴图元数据（用于序列化到 meta 中）
+export type TextureMeta = Omit<TextureData, "data">;
+
+export type PPCFile = {
+  version: string;
+  meta: {
+    generator: string;
+    createdAt: string;
+    source: string;
+    units: string;
+    checksum: {
+      algorithm: string;
+      value: string;
+      scope: string;
+    };
+  };
+  vertices: number[][];
+  triangles: number[][];
+  // UV 坐标数据（可选，用于贴图）
+  uvs?: number[][];
+  groups?: {
+    id: number;
+    color: string;
+    treeParent?: [number, number | null][];
+    faces?: number[]; // legacy: <=1.2 使用 faces 顺序持久化
+    name?: string;
+    placeAngle?: number;
+  }[];
+  groupColorCursor?: number;
+  annotations?: {
+    settings?: Record<string, unknown>;
+    // 边级拼接方式覆盖表，仅保存非 default 的显式覆盖。
+    // 采用 [edgeKey, joinType][] 的数组格式，便于 JSON / 二进制 meta 直接序列化。
+    edgeJoinTypes?: [string, string][];
+    [key: string]: unknown;
+  };
+  // 贴图数据
+  textures?: TextureMeta[];
+  // 贴图二进制数据（用于序列化，不存入 meta）
+  textureBinaries?: ArrayBuffer[];
+};
+
+const FORMAT_VERSION = "1.3"; // 1.3 起展开组持久化 treeParent，faces 仅保留旧版本兼容读取
+const MAGIC = "3DPPCBIN";
+
+async function computeChecksum(payload: unknown): Promise<string> {
+  const encoder = new TextEncoder();
+  const data = encoder.encode(JSON.stringify(payload));
+  if (crypto?.subtle) {
+    const hashBuffer = await crypto.subtle.digest("SHA-256", data);
+    const hashArray = Array.from(new Uint8Array(hashBuffer));
+    return hashArray.map((b) => b.toString(16).padStart(2, "0")).join("");
+  }
+  let hash = 0;
+  for (let i = 0; i < data.length; i++) {
+    hash = (hash << 5) - hash + data[i];
+    hash |= 0;
+  }
+  return hash.toString(16);
+}
+
+export async function build3dppcData(object: Group): Promise<PPCFile> {
+  const collected = collectGeometry(object);
+  const round5 = (n: number) => Math.round(n * 1e5) / 1e5;
+  const exportVertices = collected.vertices.map(([x, y, z]) => [round5(x), round5(y), round5(z)]);
+  const exportTriangles = collected.triangles;
+
+  const checksum = await computeChecksum({
+    vertices: exportVertices,
+    triangles: exportTriangles,
+  });
+
+  const groupsData: NonNullable<PPCFile["groups"]> = [];
+  const rawGroups = exportGroupsData();
+  rawGroups.forEach((g) => {
+    groupsData.push({
+      id: g.id,
+      color: `#${g.color.toString(16).padStart(6, "0")}`,
+      treeParent: [...g.treeParent],
+      name: g.name,
+      placeAngle: g.placeAngle,
+    });
+  });
+
+  const settings = getSettings();
+  const includeTextures = settings.includeTextureInProject === "include";
+  const texturesForExport = includeTextures ? getTexturesForExport() : [];
+  const textureMeta: TextureMeta[] | undefined = includeTextures
+    ? texturesForExport.map((tex) => ({
+        id: tex.id,
+        name: tex.name,
+        format: tex.format,
+        width: tex.width,
+        height: tex.height,
+        colorSpace: tex.colorSpace,
+        flipY: tex.flipY,
+        metadata: normalizeTextureMetadata(tex),
+      }))
+    : undefined;
+
+  return {
+    version: FORMAT_VERSION,
+    meta: {
+      generator: "3D Printed Paper Craft",
+      createdAt: new Date().toISOString(),
+      source: getCurrentProject().name,
+      units: "meter",
+      checksum: {
+        algorithm: "SHA-256",
+        value: checksum,
+        scope: "geometry",
+      },
+    },
+    vertices: exportVertices,
+    triangles: exportTriangles,
+    uvs: collected.uvs,
+    groupColorCursor: getGroupColorCursor(),
+    groups: groupsData,
+    annotations: {
+      settings,
+      edgeJoinTypes: exportEdgeJoinTypes(),
+    },
+    textures: textureMeta,
+    textureBinaries: includeTextures ? texturesForExport.map((tex) => tex.data) : undefined,
+  };
+}
+
+function encodeBinaryPPC(data: PPCFile): ArrayBuffer {
+  const enc = new TextEncoder();
+  const meta = {
+    version: data.version,
+    meta: data.meta,
+    groups: data.groups,
+    groupColorCursor: data.groupColorCursor,
+    annotations: data.annotations,
+    textures: data.textures,
+    uvs: data.uvs,
+  };
+  const metaBytes = enc.encode(JSON.stringify(meta));
+
+  const vertexCount = data.vertices.length;
+  const triCount = data.triangles.length;
+
+  // 计算贴图数据大小
+  let textureDataSize = 0;
+  const textureBinaries = data.textureBinaries || [];
+  for (const texData of textureBinaries) {
+    textureDataSize += 4; // 长度前缀
+    textureDataSize += texData.byteLength;
+  }
+
+  const headerSize = 28; // magic(8) + ver(2) + pad(2) + counts(4x4)
+  const vSize = vertexCount * 3 * 4;
+  const tSize = triCount * 3 * 4;
+  const total = headerSize + vSize + tSize + metaBytes.length + textureDataSize;
+  const buffer = new ArrayBuffer(total);
+  const view = new DataView(buffer);
+  let offset = 0;
+
+  // magic
+  for (let i = 0; i < MAGIC.length; i++) view.setUint8(offset++, MAGIC.charCodeAt(i));
+  // version
+  const [major, minor] = data.version.split(".").map((s) => parseInt(s, 10) || 0);
+  view.setUint8(offset++, major);
+  view.setUint8(offset++, minor);
+  view.setUint16(offset, 0, true); offset += 2; // reserved
+  view.setUint32(offset, vertexCount, true); offset += 4;
+  view.setUint32(offset, triCount, true); offset += 4;
+  view.setUint32(offset, metaBytes.length, true); offset += 4;
+  view.setUint32(offset, textureDataSize, true); offset += 4; // texture data size
+
+  // vertices
+  const vArr = new Float32Array(buffer, offset, vertexCount * 3);
+  data.vertices.forEach(([x, y, z], idx) => {
+    const base = idx * 3;
+    vArr[base] = x;
+    vArr[base + 1] = y;
+    vArr[base + 2] = z;
+  });
+  offset += vSize;
+
+  // triangles
+  const tArr = new Uint32Array(buffer, offset, triCount * 3);
+  data.triangles.forEach(([a, b, c], idx) => {
+    const base = idx * 3;
+    tArr[base] = a;
+    tArr[base + 1] = b;
+    tArr[base + 2] = c;
+  });
+  offset += tSize;
+
+  // meta
+  new Uint8Array(buffer, offset, metaBytes.length).set(metaBytes);
+  offset += metaBytes.length;
+
+  // texture data (每个贴图: 长度(4 bytes) + 数据)
+  for (const texData of textureBinaries) {
+    view.setUint32(offset, texData.byteLength, true);
+    offset += 4;
+    const texDataArray = new Uint8Array(texData);
+    new Uint8Array(buffer, offset, texData.byteLength).set(texDataArray);
+    offset += texData.byteLength;
+  }
+
+  return buffer;
+}
+
+function decodeBinaryPPC(buffer: ArrayBuffer): PPCFile {
+  const view = new DataView(buffer);
+  let offset = 0;
+  let magic = "";
+  for (let i = 0; i < MAGIC.length; i++) {
+    magic += String.fromCharCode(view.getUint8(offset++));
+  }
+  if (magic !== MAGIC) {
+    throw new Error("Invalid 3dppc magic");
+  }
+  const major = view.getUint8(offset++);
+  const minor = view.getUint8(offset++);
+  offset += 2; // reserved
+  const vertexCount = view.getUint32(offset, true); offset += 4;
+  const triCount = view.getUint32(offset, true); offset += 4;
+  const metaLen = view.getUint32(offset, true); offset += 4;
+
+  // 检查是否为1.1及以上版本（支持贴图数据）
+  // 通过版本号判断，而不是 buffer 大小
+  const hasTextureSupport = major > 1 || (major === 1 && minor >= 1);
+  let textureDataSize = 0;
+  if (hasTextureSupport) {
+    textureDataSize = view.getUint32(offset, true); offset += 4;
+  }
+
+  // 安全检查：防止过大的 metaLen 导致崩溃
+  if (metaLen > buffer.byteLength || offset + metaLen > buffer.byteLength) {
+    throw new Error(`Invalid meta length: ${metaLen}`);
+  }
+
+  const vArr = new Float32Array(buffer, offset, vertexCount * 3);
+  offset += vertexCount * 3 * 4;
+  const tArr = new Uint32Array(buffer, offset, triCount * 3);
+  offset += triCount * 3 * 4;
+
+  const metaBytes = new Uint8Array(buffer, offset, metaLen);
+  const dec = new TextDecoder();
+  const meta = JSON.parse(dec.decode(metaBytes));
+  offset += metaLen;
+
+  // 读取贴图数据（仅1.1及以上版本）
+  let textures: TextureData[] | undefined;
+  if (hasTextureSupport && meta.textures && meta.textures.length > 0 && textureDataSize > 0) {
+    textures = [];
+    for (const texMeta of meta.textures) {
+      const texDataLen = view.getUint32(offset, true);
+      offset += 4;
+      const texData = buffer.slice(offset, offset + texDataLen);
+      offset += texDataLen;
+
+      textures.push({
+        ...texMeta,
+        metadata: normalizeTextureMetadata(texMeta),
+        data: texData,
+      } as TextureData);
+    }
+  }
+
+  const vertices: number[][] = [];
+  for (let i = 0; i < vertexCount; i++) {
+    const base = i * 3;
+    vertices.push([vArr[base], vArr[base + 1], vArr[base + 2]]);
+  }
+  const triangles: number[][] = [];
+  for (let i = 0; i < triCount; i++) {
+    const base = i * 3;
+    triangles.push([tArr[base], tArr[base + 1], tArr[base + 2]]);
+  }
+
+  return {
+    version: meta.version ?? `${major}.${minor}`,
+    meta: meta.meta,
+    vertices,
+    triangles,
+    uvs: meta.uvs,
+    groups: meta.groups,
+    groupColorCursor: meta.groupColorCursor,
+    annotations: meta.annotations,
+    textures,
+  };
+}
+
+export function download3dppc(data: PPCFile): string {
+  const bin = encodeBinaryPPC(data);
+  const blob = new Blob([bin], { type: "application/octet-stream" });
+  const url = URL.createObjectURL(blob);
+  const base = getCurrentProject().name || "未命名工程";
+  const now = new Date();
+  const pad = (n: number) => n.toString().padStart(2, "0");
+  const stamp = `${pad(now.getFullYear() % 100)}${pad(now.getMonth() + 1)}${pad(now.getDate())}${pad(
+    now.getHours(),
+  )}${pad(now.getMinutes())}`;
+  const name = `${base}_${stamp}.3dppc`;
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = name;
+  a.click();
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
+  return name;
+}
+
+export async function load3dppc(url: string) {
+  const res = await fetch(url);
+  const buffer = await res.arrayBuffer();
+
+  const isBinary =
+    buffer.byteLength >= MAGIC.length &&
+    MAGIC === new TextDecoder().decode(new Uint8Array(buffer, 0, MAGIC.length));
+
+  const data: PPCFile = isBinary ? decodeBinaryPPC(buffer) : ((await (async () => {
+    const text = new TextDecoder().decode(buffer);
+    return JSON.parse(text) as PPCFile;
+  })()) as PPCFile);
+
+  if (!Array.isArray(data.vertices) || !Array.isArray(data.triangles)) {
+    throw new Error("3dppc 格式缺少 vertices/triangles");
+  }
+  const group = new Group();
+
+  const vertices = data.vertices;
+  const triangles = data.triangles;
+
+  const positions: number[] = [];
+  const indices: number[] = [];
+
+  vertices.forEach(([x, y, z]) => {
+    positions.push(x, y, z);
+  });
+  triangles.forEach(([a, b, c]) => {
+    indices.push(a, b, c);
+  });
+
+  const geometry = new BufferGeometry();
+  geometry.setAttribute("position", new Float32BufferAttribute(positions, 3));
+  geometry.setIndex(indices);
+
+  // 恢复 UV 数据（如果有）
+  if (data.uvs && data.uvs.length > 0) {
+    const uvs: number[] = [];
+    data.uvs.forEach(([u, v]) => {
+      uvs.push(u, v);
+    });
+    geometry.setAttribute("uv", new Float32BufferAttribute(uvs, 2));
+  }
+
+  geometry.computeVertexNormals();
+
+  const mesh = new Mesh(geometry);
+  group.add(mesh);
+
+  const colorCursor =
+    typeof data.groupColorCursor === "number"
+      ? data.groupColorCursor
+      : undefined;
+
+  return {
+    object: group,
+    groups: data.groups,
+    colorCursor,
+    annotations: data.annotations,
+    textures: data.textures as TextureData[] | undefined,
+    uvs: data.uvs,
+  };
+}

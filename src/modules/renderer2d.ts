@@ -1,0 +1,631 @@
+// 2D 展开预览渲染器：在右侧区域创建正交相机的 Three.js 场景，用于后续绘制展开组三角面与交互。
+import { CanvasTexture, Group, OrthographicCamera, Scene, Sprite, SpriteMaterial, WebGLRenderer, Vector3, Vector2 } from "three";
+import { LineSegments2 } from "three/examples/jsm/lines/LineSegments2.js";
+import { LineSegmentsGeometry } from "three/examples/jsm/lines/LineSegmentsGeometry.js";
+import { BBoxRuler, createScene2D } from "./scene";
+import { appEventBus } from "./eventBus";
+import { getWorkspaceState } from "@/types/workspaceState";
+import { isSafari } from "./utils";
+import { distancePointToSegment2, pointInSegmentRectangle2, rotate2 } from "./mathUtils";
+import type { EdgeCache } from "./unfold2dManager";
+import { createHoverLineMaterial, createSeamConnectLineMaterial } from "./materials";
+import type { Vec2 } from "@/types/geometryTypes";
+import { disposeGroupDeep } from "./threeUtils";
+
+type EdgeQueryProviders = {
+  getEdges: () => Map<number, { edges: Map<number, EdgeCache[]>; medianEdgeLength: number }>;
+  getBounds: () => { minX: number; maxX: number; minY: number; maxY: number } | null | undefined;
+  getFaceIdToEdges: () => Map<number, [number, number, number]>;
+  getPreviewGroupId: () => number;
+};
+
+export type Renderer2DContext = {
+  scene: Scene;
+  camera: OrthographicCamera;
+  renderer: WebGLRenderer;
+  root: Group;
+  bboxRuler: BBoxRuler;
+  setEdgeQueryProviders: (providers: EdgeQueryProviders) => void;
+  setFaceHoverTargets: (targets: [LineSegments2, LineSegments2, LineSegments2]) => void;
+  refreshSeamConnectLines: (dashScale: number) => void;
+  dispose: () => void;
+};
+
+export function createRenderer2D(
+  getViewport: () => { width: number; height: number },
+  mountRenderer: (canvas: HTMLElement) => void,
+  getCurrentGroupPlaceAngle: () => number,
+  updateCurrentGroupPlaceAngle: (deltaAngle: number) => void,
+  onReorderFaces?: (groupId: number, parentFaceId: number, movedFaceId: number) => boolean,
+): Renderer2DContext {
+  const { width, height } = getViewport();
+  const { scene, camera, renderer, bboxRuler } = createScene2D(width, height);
+  mountRenderer(renderer.domElement);
+  const root = new Group();
+  scene.add(root);
+  const hoverLineGeom = new LineSegmentsGeometry();
+  hoverLineGeom.setPositions(new Float32Array(6));
+  const hoverLineMat = createHoverLineMaterial({ width, height });
+  const hoverLine = new LineSegments2(hoverLineGeom, hoverLineMat);
+  hoverLine.visible = false;
+  scene.add(hoverLine);
+
+  let isPanning = false;
+  let isRotating = false;
+  let rotateAngleDeltaTotal = 0;
+  const panStart = { x: 0, y: 0 };
+  const leftDownPos = { x: 0, y: 0 };
+  let leftPointerActive = false;
+  let leftRotateTriggeredDuringPointerCycle = false;
+  let pendingReorderEdge: { groupId: number; edgeId: number; clickedFaceId: number } | null = null;
+  let hoverFaceLines: [LineSegments2, LineSegments2, LineSegments2] | null = null;
+  let seamConnectLines: [LineSegments2, LineSegments2, LineSegments2] | null = null;
+  let seamConnectArrows: [Sprite, Sprite, Sprite] | null = null;
+  let edgeQueryProviders: EdgeQueryProviders | null = null;
+
+  const createReorderArrowSprite = () => {
+    const canvas = document.createElement("canvas");
+    canvas.width = 128;
+    canvas.height = 128;
+    const ctx = canvas.getContext("2d")!;
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+    ctx.font = "bold 88px sans-serif";
+    ctx.fillStyle = "#ff9f1a";
+    ctx.textAlign = "center";
+    ctx.textBaseline = "middle";
+    ctx.fillText("⇧", canvas.width / 2, canvas.height / 2);
+    const texture = new CanvasTexture(canvas);
+    const material = new SpriteMaterial({
+      map: texture,
+      depthTest: false,
+      depthWrite: false,
+      transparent: true,
+    });
+    const sprite = new Sprite(material);
+    sprite.renderOrder = 1000;
+    sprite.visible = false;
+    scene.add(sprite);
+    return sprite;
+  };
+
+  const cancelHoverLineState = () => {
+    if (hoverLine) hoverLine.visible = false;
+    appEventBus.emit("edgeHover2DClear", undefined);
+    lastHitEdge = null;
+    showSeamConnectionLine([], 0, null);
+  }
+
+  const showSeamConnectionLine = (rec: EdgeCache[], lineIdx: number, activeFaceId: number | null) => {
+    seamConnectLines![lineIdx].visible = false;
+    if (seamConnectArrows) seamConnectArrows[lineIdx].visible = false;
+    if (!rec || rec.length !== 2) return;
+    const midPointA = [(rec[0].unfoldedPos[0].x + rec[0].unfoldedPos[1].x) / 2, (rec[0].unfoldedPos[0].y + rec[0].unfoldedPos[1].y) / 2];
+    const midPointB = [(rec[1].unfoldedPos[0].x + rec[1].unfoldedPos[1].x) / 2, (rec[1].unfoldedPos[0].y + rec[1].unfoldedPos[1].y) / 2];
+    const dirAB = [midPointA[0] - midPointB[0], midPointA[1] - midPointB[1]];
+    const lenAB = Math.sqrt(dirAB[0] * dirAB[0] + dirAB[1] * dirAB[1]);
+    if (lenAB < 1e-5) return;
+    const normDirAB = [dirAB[0] / lenAB, dirAB[1] / lenAB];
+    const lenA = Math.hypot(rec[0].unfoldedPos[1].x - rec[0].unfoldedPos[0].x, rec[0].unfoldedPos[1].y - rec[0].unfoldedPos[0].y);
+    const lenB = Math.hypot(rec[1].unfoldedPos[1].x - rec[1].unfoldedPos[0].x, rec[1].unfoldedPos[1].y - rec[1].unfoldedPos[0].y);
+    const connectionOffset = Math.min(lenAB, lenA, lenB) * 0.08;
+    const connectPointA = [midPointA[0] - normDirAB[0] * connectionOffset, midPointA[1] - normDirAB[1] * connectionOffset];
+    const connectPointB = [midPointB[0] + normDirAB[0] * connectionOffset, midPointB[1] + normDirAB[1] * connectionOffset];
+    const rotatedA = rotate2(connectPointA as Vec2, getCurrentGroupPlaceAngle());
+    const rotatedB = rotate2(connectPointB as Vec2, getCurrentGroupPlaceAngle());
+    const connectionLine = seamConnectLines![lineIdx];
+    connectionLine.visible = true;
+    const connGeom = connectionLine.geometry as LineSegmentsGeometry;
+    connGeom.setPositions(new Float32Array([rotatedA[0], rotatedA[1], 2, rotatedB[0], rotatedB[1], 2]));
+    connectionLine.computeLineDistances();
+
+    if (getWorkspaceState() !== "editingGroup" || activeFaceId === null || !seamConnectArrows) return;
+    const faceIds = [rec[0].faceId, rec[1].faceId];
+    const activeFaceIdx = faceIds.indexOf(activeFaceId);
+    if (activeFaceIdx < 0) return;
+    const movedFaceIdx = activeFaceIdx === 0 ? 1 : 0;
+    const arrowFrom = movedFaceIdx === 0 ? rotatedA : rotatedB;
+    const arrowTo = movedFaceIdx === 0 ? rotatedB : rotatedA;
+    const arrowDirX = arrowTo[0] - arrowFrom[0];
+    const arrowDirY = arrowTo[1] - arrowFrom[1];
+    const arrowDirLen = Math.hypot(arrowDirX, arrowDirY);
+    if (arrowDirLen < 1e-5) return;
+    const arrow = seamConnectArrows[lineIdx];
+    const tex = (arrow.material as SpriteMaterial).map as CanvasTexture;
+    const texImage = tex.image as HTMLCanvasElement;
+    const aspect = texImage.width / texImage.height || 1;
+    const arrowHeight = Math.min(lenA, lenB) * 0.35;
+    arrow.visible = true;
+    arrow.position.set(arrowFrom[0], arrowFrom[1], 3);
+    arrow.scale.set(arrowHeight * aspect, arrowHeight, 1);
+    arrow.material.rotation = Math.atan2(arrowDirY, arrowDirX) - Math.PI / 2;
+  };
+
+  const resizeRenderer2D = () => {
+    const { width, height } = getViewport();
+    renderer.setSize(width, height);
+    camera.left = -width * 0.5;
+    camera.right = width * 0.5;
+    camera.top = height * 0.5;
+    camera.bottom = -height * 0.5;
+    camera.updateProjectionMatrix();
+    const mat = hoverLine.material as any;
+    mat.resolution?.set(width, height);
+    hoverFaceLines?.forEach((line) => {
+      const m = line.material as any;
+      m.resolution?.set(width, height);
+    });
+    seamConnectLines?.forEach((line) => {
+      const m = line.material as any;
+      m.resolution?.set(width, height);
+    })
+  };
+  
+  window.addEventListener("resize", resizeRenderer2D);
+  const onContextMenu = (e: Event) => e.preventDefault();
+  renderer.domElement.addEventListener("contextmenu", onContextMenu);
+
+  const onWheel = (event: WheelEvent) => {
+    event.preventDefault();
+    const delta = event.deltaY;
+    const scale = delta > 0 ? 1.1 : 0.9;
+    camera.zoom = Math.max(0.0001, camera.zoom * scale);
+    camera.updateProjectionMatrix();
+    onPointerMove(new PointerEvent('pointermove', {
+        movementX: 0,
+        movementY: 0,
+        clientX: event.clientX,
+        clientY: event.clientY,
+    }));
+    appEventBus.emit("userOperation", { side: "right", op: "view-zoom", highlightDuration: 200})
+  };
+  renderer.domElement.addEventListener("wheel", onWheel, { passive: false });
+
+  const screenToWorldDelta = (dx: number, dy: number) => {
+    // 将屏幕位移转换到相机平面上的位移
+    const w = renderer.domElement.clientWidth || renderer.domElement.width || 1;
+    const h = renderer.domElement.clientHeight || renderer.domElement.height || 1;
+    const worldDx = (dx / w) * (camera.right - camera.left) / camera.zoom;
+    const worldDy = (dy / h) * (camera.top - camera.bottom) / camera.zoom;
+    return { x: worldDx, y: -worldDy };
+  };
+
+  const screenPosToWorldPos = (sx: number, sy: number) => {
+    const rect = renderer.domElement.getBoundingClientRect();
+    const ndcX = ((sx - rect.left) / rect.width) * 2 - 1;
+    const ndcY = -((sy - rect.top) / rect.height) * 2 + 1;
+    const worldX = camera.position.x + (ndcX * (camera.right - camera.left) * 0.5) / camera.zoom;
+    const worldY = camera.position.y + (ndcY * (camera.top - camera.bottom) * 0.5) / camera.zoom;
+    return { x: worldX, y: worldY };
+  }
+
+  const startRotate = () => {
+    if (isRotating) return;
+    if (!isSafari()) renderer.domElement.requestPointerLock?.();
+    isRotating = true;
+    rotateAngleDeltaTotal = 0;
+    cancelHoverLineState();
+    appEventBus.emit("userOperation", { side: "right", op: "group-rotate", highlightDuration: 0 });
+  };
+
+  const tryReorderPendingEdge = () => {
+    if (!pendingReorderEdge || !edgeQueryProviders || !onReorderFaces) {
+      return false;
+    }
+    const rec = edgeQueryProviders.getEdges().get(pendingReorderEdge.groupId)?.edges.get(pendingReorderEdge.edgeId);
+    if (!rec || rec.length !== 2) {
+      return false;
+    }
+    const faceIds = Array.from(new Set(rec.map((item) => item.faceId)));
+    if (faceIds.length !== 2) {
+      return false;
+    }
+    if (!faceIds.includes(pendingReorderEdge.clickedFaceId)) {
+      return false;
+    }
+    const parentFaceId = pendingReorderEdge.clickedFaceId;
+    const movedFaceId = faceIds[0] === parentFaceId ? faceIds[1] : faceIds[0];
+    const ok = onReorderFaces(pendingReorderEdge.groupId, parentFaceId, movedFaceId);
+    if (!ok) {
+      return false;
+    }
+    appEventBus.emit("userOperation", { side: "right", op: "group-reorder", highlightDuration: 500 });
+    return true;
+  };
+
+  const onPointerDown = (event: PointerEvent) => {
+    if (event.button === 2) {
+      if (!isSafari()) renderer.domElement.requestPointerLock?.();
+      isPanning = true;
+      panStart.x = event.clientX;
+      panStart.y = event.clientY;
+      cancelHoverLineState();
+      appEventBus.emit("userOperation", { side: "right", op: "view-pan", highlightDuration: 0 });
+      return;
+    }
+
+    if (event.button !== 0 || getWorkspaceState() !== "editingGroup") return;
+    leftPointerActive = true;
+    leftRotateTriggeredDuringPointerCycle = false;
+    leftDownPos.x = event.clientX;
+    leftDownPos.y = event.clientY;
+    pendingReorderEdge = null;
+
+    if (edgeQueryProviders && lastHitEdge && lastHitEdge.groupId === edgeQueryProviders.getPreviewGroupId()) {
+      const rec = edgeQueryProviders.getEdges().get(lastHitEdge.groupId)?.edges.get(lastHitEdge.edgeId);
+      if (rec && rec.length === 2) {
+        pendingReorderEdge = {
+          groupId: lastHitEdge.groupId,
+          edgeId: lastHitEdge.edgeId,
+          clickedFaceId: lastHitEdge.cache.faceId,
+        };
+        return;
+      }
+    }
+    leftRotateTriggeredDuringPointerCycle = true;
+    startRotate();
+  };
+  let lastHitEdge: { groupId: number; edgeId: number; cache: EdgeCache } | null = null;
+  const onPointerMove = (event: PointerEvent) => {
+    if (
+      !isRotating &&
+      leftPointerActive &&
+      pendingReorderEdge !== null &&
+      getWorkspaceState() === "editingGroup" &&
+      (event.buttons & 1) === 1
+    ) {
+      const dx = event.clientX - leftDownPos.x;
+      const dy = event.clientY - leftDownPos.y;
+      if (dx * dx + dy * dy > 9) {
+        pendingReorderEdge = null;
+        leftRotateTriggeredDuringPointerCycle = true;
+        startRotate();
+      }
+    }
+    if (isPanning) {
+      const locked = document.pointerLockElement === renderer.domElement;
+      const dx = locked ? event.movementX : event.clientX - panStart.x;
+      const dy = locked ? event.movementY : event.clientY - panStart.y;
+      const { x, y } = screenToWorldDelta(dx, dy);
+      camera.position.x -= x;
+      camera.position.y -= y;
+      camera.updateProjectionMatrix();
+      if (!locked) {
+        panStart.x = event.clientX;
+        panStart.y = event.clientY;
+      }
+      // appEventBus.emit("userOperation", { side: "right", op: "view-pan" });
+      return;
+    }
+    if (isRotating) {
+      const deltaAngle = event.movementX * 0.005;
+      rotateAngleDeltaTotal += deltaAngle;
+      updateCurrentGroupPlaceAngle(deltaAngle);
+      if (hoverLine && hoverLine.visible) {
+        hoverLine.rotateOnAxis(new Vector3(0, 0, 1), deltaAngle);
+      }
+      return;
+    }
+    if (!edgeQueryProviders) return;
+    const bounds = edgeQueryProviders.getBounds();
+    if (!bounds) return;
+
+    let margin = 2;
+    const edgeData = edgeQueryProviders.getEdges();
+    for (const [, { medianEdgeLength }] of edgeData) {
+      if (medianEdgeLength > 0) {
+        margin = medianEdgeLength * 0.05;
+        break;
+      }
+    }
+    const { x: wx, y: wy } = screenPosToWorldPos(event.clientX, event.clientY);
+    const { minX, maxX, minY, maxY } = bounds;
+    if (
+      wx < minX - margin ||
+      wx > maxX + margin ||
+      wy < minY - margin ||
+      wy > maxY + margin
+    ) {
+      if (lastHitEdge) {
+        cancelHoverLineState();
+      }
+      lastHitEdge = null;
+      return;
+    }
+    const [ worldX, worldY ] = rotate2([wx, wy], -getCurrentGroupPlaceAngle());
+    let hitEdge:
+      | { groupId: number; edgeId: number; cache: EdgeCache }
+      | null = null;
+    let minDist = Infinity;
+    for (const [gid, data] of edgeData) {
+      for (const [eid, edges] of data.edges) {
+        for (const cache of edges) {
+          const [p1, p2] = cache.unfoldedPos;
+
+          const minBx = Math.min(p1.x, p2.x) - margin;
+          const maxBx = Math.max(p1.x, p2.x) + margin;
+          const minBy = Math.min(p1.y, p2.y) - margin;
+          const maxBy = Math.max(p1.y, p2.y) + margin;
+          if (worldX < minBx || worldX > maxBx || worldY < minBy || worldY > maxBy) continue;
+
+          if (!pointInSegmentRectangle2([worldX, worldY], [p1.x, p1.y], [p2.x, p2.y], margin)) continue;
+
+          const dist = distancePointToSegment2([worldX, worldY], [p1.x, p1.y], [p2.x, p2.y]);
+          if (dist < minDist) {
+            minDist = dist;
+            hitEdge = { groupId: gid, edgeId: eid, cache };
+          }
+        }
+      }
+    }
+
+    if (hitEdge) {
+      if (lastHitEdge && lastHitEdge.groupId === hitEdge.groupId && lastHitEdge.edgeId === hitEdge.edgeId && lastHitEdge.cache.faceId === hitEdge.cache.faceId) return;
+      lastHitEdge = hitEdge;
+      const [p1, p2] = hitEdge.cache.unfoldedPos;
+      const p1Rotated = rotate2([p1.x, p1.y], getCurrentGroupPlaceAngle());
+      const p2Rotated = rotate2([p2.x, p2.y], getCurrentGroupPlaceAngle());
+      (hoverLine.geometry as LineSegmentsGeometry).setPositions(
+        new Float32Array([p1Rotated[0], p1Rotated[1], 1, p2Rotated[0], p2Rotated[1], 1]),
+      );
+      hoverLine.visible = true;
+      hoverLine.rotation.set(0, 0, 0);
+      const [o1, o2] = hitEdge.cache.origPos;
+      appEventBus.emit("edgeHover2D", {
+        groupId: hitEdge.groupId,
+        edgeId: hitEdge.edgeId,
+        p1: [o1.x, o1.y, o1.z],
+        p2: [o2.x, o2.y, o2.z],
+      });
+
+      const rec = edgeData.get(hitEdge.groupId)?.edges.get(hitEdge.edgeId);
+      if (rec) showSeamConnectionLine(rec, 0, hitEdge.cache.faceId);
+    } else if (lastHitEdge) {
+      cancelHoverLineState();
+    }
+  };
+
+  const stopPan = () => {
+    if (!isPanning) return;
+    isPanning = false;
+    if (document.pointerLockElement === renderer.domElement) {
+      document.exitPointerLock();
+    }
+    appEventBus.emit("userOperationDone", { side: "right", op: "view-pan" });
+  };
+
+  const stopRotate = () => {
+    if (!isRotating) return;
+    isRotating = false;
+    rotateAngleDeltaTotal = 0;
+    if (document.pointerLockElement === renderer.domElement) {
+      document.exitPointerLock();
+    }
+    appEventBus.emit("userOperationDone", { side: "right", op: "group-rotate" });
+  }
+
+  const onPointerUp = (event: PointerEvent) => {
+    if (event.button === 2) {
+      stopPan();
+    } else if (event.button === 0) {
+      if (
+        leftPointerActive &&
+        pendingReorderEdge !== null &&
+        !leftRotateTriggeredDuringPointerCycle &&
+        getWorkspaceState() === "editingGroup"
+      ) {
+        const reordered = tryReorderPendingEdge();
+        if (reordered) {
+          cancelHoverLineState();
+        }
+      }
+      stopRotate();
+      leftPointerActive = false;
+      leftRotateTriggeredDuringPointerCycle = false;
+      pendingReorderEdge = null;
+    }
+    onPointerMove(event);
+  };
+
+  const onPointerLeave = (event: PointerEvent) => {
+    cancelHoverLineState();
+  };
+
+  renderer.domElement.addEventListener("pointerup", onPointerUp);
+  renderer.domElement.addEventListener("pointercancel", onPointerUp);
+  renderer.domElement.addEventListener("pointerleave", onPointerLeave);
+  renderer.domElement.addEventListener("pointermove", onPointerMove);
+  renderer.domElement.addEventListener("pointerdown", onPointerDown);
+
+  const onHoverFace = (faceId: number | null) => {
+    if (!hoverFaceLines) return;
+    hoverFaceLines.forEach((l) => (l.visible = false));
+    if (!seamConnectLines) return;
+    seamConnectLines.forEach((l) => (l.visible = false));
+    seamConnectArrows?.forEach((arrow) => (arrow.visible = false));
+    if (faceId === null) {
+      return;
+    }
+    if (!edgeQueryProviders) return;
+    const previewGroupId = edgeQueryProviders.getPreviewGroupId();
+    const faceIdToEdges = edgeQueryProviders.getFaceIdToEdges();
+    const cache = edgeQueryProviders.getEdges().get(previewGroupId)?.edges;
+    if (!cache) return;
+
+    const edgeIds = faceIdToEdges.get(faceId);
+    edgeIds?.forEach((edgeId, idx) => {
+      const rec = cache.get(edgeId);
+      if (!rec || rec.length === 0) return;
+      const [p1, p2] = rec[0].faceId === faceId ? rec[0].unfoldedPos : rec[rec.length - 1].unfoldedPos;
+      const line = hoverFaceLines![idx];
+      line.visible = true;
+      const geom = line.geometry as LineSegmentsGeometry;
+      const p1Rotated = rotate2([p1.x, p1.y], getCurrentGroupPlaceAngle());
+      const p2Rotated = rotate2([p2.x, p2.y], getCurrentGroupPlaceAngle());
+      geom.setPositions(new Float32Array([p1Rotated[0], p1Rotated[1], 1, p2Rotated[0], p2Rotated[1], 1]));
+      // 如果有两个2d边对应一条3d边，则绘制拼接关系线
+      if (rec.length === 2) {
+        showSeamConnectionLine(rec, idx, faceId);
+      }
+    });
+  };
+  let currentFaceHoverFrom3D: number | null = null;
+  appEventBus.on("faceHover3D", (faceId) => {
+    currentFaceHoverFrom3D = faceId;
+    onHoverFace(faceId);
+  });
+  appEventBus.on("faceHover3DClear", () => {
+    currentFaceHoverFrom3D = null;
+    hoverFaceLines?.forEach((l) => (l.visible = false));
+    seamConnectLines?.forEach((l) => (l.visible = false));
+    seamConnectArrows?.forEach((arrow) => (arrow.visible = false));
+  });
+  let updateHoverFaceByFaceIdNextFrame: number | null = null;
+  appEventBus.on("groupFaceAdded", ({ groupId, faceId }) => {
+    updateHoverFaceByFaceIdNextFrame = currentFaceHoverFrom3D;
+  });
+  appEventBus.on("groupFaceRemoved", ({ groupId, faceId }) => {
+    updateHoverFaceByFaceIdNextFrame = currentFaceHoverFrom3D;
+  });
+  appEventBus.on("groupTreeReordered", ({ movedFaceId }) => {
+    updateHoverFaceByFaceIdNextFrame = currentFaceHoverFrom3D;
+  });
+  appEventBus.on("clearAppStates", () => {
+    currentFaceHoverFrom3D = null;
+    hoverFaceLines?.forEach((l) => (l.visible = false));
+    seamConnectLines?.forEach((l) => (l.visible = false));
+    seamConnectArrows?.forEach((arrow) => (arrow.visible = false));
+    if (hoverLine) hoverLine.visible = false;
+    lastHitEdge = null;
+    leftPointerActive = false;
+    leftRotateTriggeredDuringPointerCycle = false;
+    pendingReorderEdge = null;
+  });
+
+  const animate = () => {
+    renderer.render(scene, camera);
+    if (updateHoverFaceByFaceIdNextFrame !== null) {
+      onHoverFace(updateHoverFaceByFaceIdNextFrame);
+      updateHoverFaceByFaceIdNextFrame = null;
+    }
+    requestAnimationFrame(animate);
+  };
+  animate();
+
+  const dispose = () => {
+    window.removeEventListener("resize", resizeRenderer2D);
+    renderer.domElement.removeEventListener("wheel", onWheel);
+    renderer.domElement.removeEventListener("contextmenu", onContextMenu);
+    renderer.domElement.removeEventListener("pointerdown", onPointerDown);
+    document.removeEventListener("pointermove", onPointerMove);
+    document.removeEventListener("pointerup", onPointerUp);
+    hoverLine.removeFromParent();
+    (hoverLine.geometry as LineSegmentsGeometry).dispose();
+    (hoverLine.material as any)?.dispose?.();
+    if (hoverFaceLines) {
+      hoverFaceLines.forEach((line) => {
+        line.removeFromParent();
+        (line.geometry as LineSegmentsGeometry).dispose();
+        (line.material as any)?.dispose?.();
+      });
+    }
+    hoverFaceLines = null;
+    if (seamConnectLines) {
+      seamConnectLines.forEach((line) => {
+        line.removeFromParent();
+        (line.geometry as LineSegmentsGeometry).dispose();
+        (line.material as any)?.dispose?.();
+      });
+    }
+    seamConnectLines = null;
+    if (seamConnectArrows) {
+      seamConnectArrows.forEach((arrow) => {
+        arrow.removeFromParent();
+        const material = arrow.material as SpriteMaterial;
+        (material.map as CanvasTexture)?.dispose();
+        material.dispose();
+      });
+    }
+    seamConnectArrows = null;
+    renderer.dispose();
+    renderer.domElement.remove();
+    isRotating = false;
+    isPanning = false;
+    rotateAngleDeltaTotal = 0;
+  };
+
+  appEventBus.on("projectChanged", resizeRenderer2D);
+
+  const initHoverFaceLines = () => {
+    if (hoverFaceLines) return;
+    const makeLine = () => {
+      const geom = new LineSegmentsGeometry();
+      geom.setPositions(new Float32Array(6));
+      const mat = createHoverLineMaterial({ width, height });
+      const line = new LineSegments2(geom, mat);
+      line.visible = false;
+      scene.add(line);
+      return line;
+    };
+    hoverFaceLines = [makeLine(), makeLine(), makeLine()];
+  };
+  initHoverFaceLines();
+
+  const initSeamConnectLines = () => {
+    initOrRebuildSeamConnectLines(1, false);
+  };
+
+  const initOrRebuildSeamConnectLines = (dashScale: number, force: boolean = true) => {
+    if (seamConnectLines && !force) return;
+    if (seamConnectLines) {
+      seamConnectLines.forEach((line) => {
+        line.removeFromParent();
+        (line.geometry as LineSegmentsGeometry).dispose();
+        (line.material as any)?.dispose?.();
+      });
+      seamConnectLines = null;
+    }
+    if (seamConnectArrows) {
+      seamConnectArrows.forEach((arrow) => {
+        arrow.removeFromParent();
+        const material = arrow.material as SpriteMaterial;
+        (material.map as CanvasTexture)?.dispose();
+        material.dispose();
+      });
+      seamConnectArrows = null;
+    }
+    const { width: viewportWidth, height: viewportHeight } = getViewport();
+    const lineWidth = viewportWidth || 1;
+    const lineHeight = viewportHeight || 1;
+    const makeLine = () => {
+      const geom = new LineSegmentsGeometry();
+      geom.setPositions(new Float32Array(6));
+      const mat = createSeamConnectLineMaterial({ width: lineWidth, height: lineHeight }, dashScale);
+      const line = new LineSegments2(geom, mat);
+      line.computeLineDistances();
+      line.visible = false;
+      scene.add(line);
+      return line;
+    };
+    seamConnectLines = [makeLine(), makeLine(), makeLine()];
+    seamConnectArrows = [createReorderArrowSprite(), createReorderArrowSprite(), createReorderArrowSprite()];
+  };
+  initSeamConnectLines();
+
+  return {
+    scene,
+    camera,
+    renderer,
+    root,
+    bboxRuler,
+    setEdgeQueryProviders: (providers: EdgeQueryProviders) => {
+      edgeQueryProviders = providers;
+    },
+    setFaceHoverTargets: (targets: [LineSegments2, LineSegments2, LineSegments2]) => {
+      hoverFaceLines = targets;
+    },
+    refreshSeamConnectLines: (dashScale: number) => {
+      initOrRebuildSeamConnectLines(dashScale, true);
+    },
+    dispose,
+  };
+}

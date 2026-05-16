@@ -1,0 +1,25 @@
+{
+  "name": "3d_printed_paper_craft",
+  "version": "1.2.1.4",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "@vercel/analytics": "^1.6.1",
+    "gif.js": "^0.2.0",
+    "jszip": "^3.10.1",
+    "replicad": "^0.20.5",
+    "replicad-opencascadejs": "^0.20.2",
+    "three": "^0.160.0"
+  },
+  "devDependencies": {
+    "@types/gif.js": "^0.2.5",
+    "@types/three": "^0.160.0",
+    "typescript": "^5.3.3",
+    "vite": "^5.0.8"
+  }
+}

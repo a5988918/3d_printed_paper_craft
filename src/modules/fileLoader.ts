@@ -1,0 +1,83 @@
+// 通用文件加载器：根据扩展名加载模型文件，并处理 3dppc 的附加数据。
+import type { Object3D } from "three";
+import { Mesh } from "three";
+import { OBJLoader } from "three/examples/jsm/loaders/OBJLoader.js";
+import { FBXLoader } from "three/examples/jsm/loaders/FBXLoader.js";
+import { STLLoader } from "three/examples/jsm/loaders/STLLoader.js";
+import { snapGeometryPositions, computeAdaptiveScale } from "./geometry";
+import { load3dppc, type PPCFile } from "./ppc";
+import type { TextureData } from "./textureManager";
+
+const objLoader = new OBJLoader();
+const fbxLoader = new FBXLoader();
+const stlLoader = new STLLoader();
+
+export async function loadRawObject(
+  file: File,
+  ext: string,
+): Promise<{
+  object: Object3D;
+  importedGroups?: PPCFile["groups"];
+  importedColorCursor?: number;
+  importedSeting?: Object;
+  importedEdgeJoinTypes?: [string, string][];
+  suggestedScale?: number;
+  importedTextures?: TextureData[];
+}> {
+  const url = URL.createObjectURL(file);
+  try {
+    let object: Object3D;
+    let importedGroups: PPCFile["groups"] | undefined;
+    let importedColorCursor: number | undefined;
+    let importedSeting: Object | undefined;
+    let importedEdgeJoinTypes: [string, string][] | undefined;
+    let suggestedScale: number | undefined;
+    let importedTextures: TextureData[] | undefined;
+
+    if (ext === "obj") {
+      const loaded = await objLoader.loadAsync(url);
+      loaded.traverse((child) => {
+        if ((child as Mesh).isMesh) {
+          snapGeometryPositions((child as Mesh).geometry);
+        }
+      });
+      object = loaded;
+      suggestedScale = computeAdaptiveScale(object);
+    } else if (ext === "fbx") {
+      const loaded = await fbxLoader.loadAsync(url);
+      loaded.traverse((child) => {
+        if ((child as Mesh).isMesh) {
+          snapGeometryPositions((child as Mesh).geometry);
+        }
+      });
+      object = loaded;
+      suggestedScale = computeAdaptiveScale(object);
+    } else if (ext === "stl") {
+      const geometry = await stlLoader.loadAsync(url);
+      snapGeometryPositions(geometry);
+      object = new Mesh(geometry);
+      suggestedScale = computeAdaptiveScale(object);
+    } else {
+      const loaded = await load3dppc(url);
+      object = loaded.object;
+      importedGroups = loaded.groups;
+      importedColorCursor = loaded.colorCursor;
+      importedTextures = loaded.textures;
+      if (loaded.annotations && typeof loaded.annotations.settings === "object") {
+        importedSeting = loaded.annotations.settings??undefined;
+      }
+      if (loaded.annotations && Array.isArray(loaded.annotations.edgeJoinTypes)) {
+        importedEdgeJoinTypes = loaded.annotations.edgeJoinTypes.filter(
+          (entry): entry is [string, string] =>
+            Array.isArray(entry) &&
+            entry.length === 2 &&
+            typeof entry[0] === "string" &&
+            typeof entry[1] === "string",
+        );
+      }
+    }
+    return { object, importedGroups, importedColorCursor, importedSeting, importedEdgeJoinTypes, suggestedScale, importedTextures };
+  } finally {
+    URL.revokeObjectURL(url);
+  }
+}
