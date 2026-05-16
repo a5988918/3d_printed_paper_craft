@@ -75,6 +75,7 @@ import { initTransientPopup, showTransientPopup } from "./modules/transientPopup
 import "./styles/home.css";
 import { renderHomeSection } from "./templates/homeMarkup";
 import { initI18n, t, getCurrentLang, setLanguage, onLanguageChanged } from "./modules/i18n";
+import { resolvePublicPath } from "./utils/publicPath";
 import {
   setHomeDemoElements,
   loadHomeDemoProjects,
@@ -229,7 +230,7 @@ app.innerHTML = `
     <section id="layout-workspace" class="page">
       <header class="editor-header">
         <div class="editor-logo">
-          <img src="/android-chrome-192x192.png" alt="Logo" />
+          <img src="${resolvePublicPath("android-chrome-192x192.png")}" alt="Logo" />
         </div>
         <div class="editor-title">
           <span class="editor-title-main" data-i18n="app.title">维极灵境折纸</span>
@@ -250,7 +251,7 @@ app.innerHTML = `
         <button class="btn ghost menu-btn-with-icon" id="export-seam-clip-btn"><span class="menu-btn-icon">${menu_export_clip_IconSvg}</span><span class="menu-btn-label" data-i18n="menu.export.seamClamp.stl">导出固定夹</span></button>
         <button class="btn ghost menu-btn-with-icon" id="settings-open-btn"><span class="menu-btn-icon">${menu_setting_IconSvg}</span><span class="menu-btn-label" data-i18n="menu.project.settings">项目设置</span></button>
         <a class="btn img-btn ghost hidden" id="jump-link-btn" target="_blank" rel="noopener noreferrer">
-          <img src="/demo/makerworld.png" alt="Jump Link" />
+          <img src="${resolvePublicPath("demo/makerworld.png")}" alt="Jump Link" />
         </a>
         <div class="about-spacer"></div>
         <button class="btn ghost menu-btn-with-icon" id="about-btn"><span class="menu-btn-icon">${menu_about_IconSvg}</span><span class="menu-btn-label" data-i18n="menu.about">帮助 & 关于</span></button>
@@ -1089,7 +1090,7 @@ const loadDemoProjectFromHome = async () => {
     await loadHomeDemoProjects();
     const demoFile = getDemoFileName();
     if (!demoFile) throw new Error("demo project config is empty");
-    const resp = await fetch(`/${demoFile}`, { cache: "no-cache" });
+    const resp = await fetch(resolvePublicPath(demoFile), { cache: "no-cache" });
     if (!resp.ok) throw new Error("demo file fetch failed");
     const blob = await resp.blob();
     const demoFileName = demoFile.replace(/[?#].*$/, "").split(/[\\/]/).pop() || demoFile;

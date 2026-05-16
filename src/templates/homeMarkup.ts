@@ -1,3 +1,5 @@
+import { resolvePublicPath } from "../utils/publicPath";
+
 export const renderHomeSection = () => `
   <section class="page home home-main active" id="layout-home">
     <div class="home-fx-layer" aria-hidden="true"></div>
@@ -5,7 +7,7 @@ export const renderHomeSection = () => `
     <div class="home-card">
       <header class="home-head">
         <div class="home-logo" aria-hidden="true">
-          <img src="/android-chrome-192x192.png" alt="3D Printed Paper Craft logo" width="54" height="54" />
+          <img src="${resolvePublicPath("android-chrome-192x192.png")}" alt="3D Printed Paper Craft logo" width="54" height="54" />
         </div>
 
         <div class="home-brand">

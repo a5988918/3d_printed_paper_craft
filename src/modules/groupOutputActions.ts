@@ -25,13 +25,14 @@ import {
   setOrCreateMetadataValue,
   setOrCreateModelSettingsMetadataValue,
 } from "./threeMF/threeMfHelper";
+import { resolvePublicPath } from "../utils/publicPath";
 
 const THREE_MF_TEMPLATE_PATH_BY_LAYER_HEIGHT: Record<Settings["layerHeight"], string> = {
-  0.08: "/threeMF_templates/template08.3mf",
-  0.12: "/threeMF_templates/template12.3mf",
-  0.16: "/threeMF_templates/template16.3mf",
-  0.2: "/threeMF_templates/template20.3mf",
-  0.24: "/threeMF_templates/template24.3mf",
+  0.08: "threeMF_templates/template08.3mf",
+  0.12: "threeMF_templates/template12.3mf",
+  0.16: "threeMF_templates/template16.3mf",
+  0.2: "threeMF_templates/template20.3mf",
+  0.24: "threeMF_templates/template24.3mf",
 };
 
 type BindGroupOutputActionsOptions = {
@@ -275,7 +276,8 @@ export function createGroupExportCallback(opts: {
   async function loadTemplate3mfBuffer() {
     const templatePath = getCurrentThreeMfTemplatePath();
     if (!template3mfPromiseByPath.has(templatePath)) {
-      template3mfPromiseByPath.set(templatePath, fetch(templatePath, { cache: "no-cache" }).then(async (response) => {
+      const resolvedPath = resolvePublicPath(templatePath);
+      template3mfPromiseByPath.set(templatePath, fetch(resolvedPath, { cache: "no-cache" }).then(async (response) => {
         if (!response.ok) {
           throw new Error(`Failed to load 3MF template ${templatePath}: ${response.status}`);
         }

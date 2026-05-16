@@ -1,5 +1,6 @@
 // 首页演示项目管理模块
 import { t } from "./i18n";
+import { resolvePublicPath } from "../utils/publicPath";
 
 export type HomeDemoProject = {
   id: string;
@@ -9,7 +10,7 @@ export type HomeDemoProject = {
   jumpLink?: string;
 };
 
-export const ZH_HOME_DEMO_CONFIG_PATH = "/demo/demo_projects.json";
+export const ZH_HOME_DEMO_CONFIG_PATH = "demo/demo_projects.json";
 
 export let homeDemoProjects: HomeDemoProject[] = [];
 export let selectedHomeDemoProjectId = "";
@@ -117,9 +118,9 @@ const normalizeHomeDemoProjects = (raw: unknown): HomeDemoProject[] => {
     )
     .map((item) => ({
       id: item.id,
-      filePath: item.filePath,
-      gifPath: item.gifPath,
-      stillPath: item.stillPath,
+      filePath: resolvePublicPath(item.filePath),
+      gifPath: resolvePublicPath(item.gifPath),
+      stillPath: resolvePublicPath(item.stillPath),
       jumpLink: (item as HomeDemoProject).jumpLink,
     }));
 };
@@ -140,7 +141,7 @@ export const loadHomeDemoProjects = async () => {
   let loaded = false;
   for (const configPath of candidatePaths) {
     try {
-      const res = await fetch(configPath, { cache: "no-cache" });
+      const res = await fetch(resolvePublicPath(configPath), { cache: "no-cache" });
       if (!res.ok) throw new Error(`failed: ${res.status}`);
       const data = await res.json();
       const parsed = normalizeHomeDemoProjects(data);

@@ -1,4 +1,6 @@
 // 简易 i18n 管理：按需异步加载语言包，提供占位返回与语言切换。
+import { resolvePublicPath } from "../utils/publicPath";
+
 type Dict = Record<string, string>;
 
 const SUPPORTED = ["en", "zh"];
@@ -74,7 +76,7 @@ export const setLanguage = async (lang: string) => {
   loading = true;
   let loaded = false;
   try {
-    const res = await fetch(`/locales/${finalLang}.json`, { cache: "no-cache" });
+    const res = await fetch(resolvePublicPath(`locales/${finalLang}.json`), { cache: "no-cache" });
     if (res.ok) {
       dict = await res.json();
       currentLang = finalLang;

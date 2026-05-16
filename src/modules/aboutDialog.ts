@@ -1,4 +1,5 @@
 import { getCurrentLang } from "./i18n";
+import { resolvePublicPath } from "../utils/publicPath";
 import { appEventBus } from "./eventBus";
 
 export type AboutDialogDeps = {
@@ -30,7 +31,7 @@ export const createAboutDialog = (deps: AboutDialogDeps) => {
     try {
       const lang = getCurrentLang();
       const aboutPath = lang.startsWith("zh") ? "about_cn.html" : "about_en.html";
-      const res = await fetch(aboutPath, { cache: "no-cache" });
+      const res = await fetch(resolvePublicPath(aboutPath), { cache: "no-cache" });
       if (res.ok) {
         aboutContent.innerHTML = await res.text();
       } else {

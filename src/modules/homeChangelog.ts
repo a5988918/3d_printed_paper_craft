@@ -1,3 +1,5 @@
+import { resolvePublicPath } from "../utils/publicPath";
+
 type ChangelogItem = { version: string; date: string; points: string[] };
 
 const parseChangelogText = (text: string): ChangelogItem[] => {
@@ -49,8 +51,8 @@ export const loadHomeChangelog = async (
   if (!homeChangelogList) return;
   try {
     const changelogPath = t("mainpage.changelogFile");
-    const path = changelogPath && changelogPath !== "mainpage.changelogFile" ? changelogPath : "/changelog.md";
-    const res = await fetch(path, { cache: "no-cache" });
+    const path = changelogPath && changelogPath !== "mainpage.changelogFile" ? changelogPath : "changelog.md";
+    const res = await fetch(resolvePublicPath(path), { cache: "no-cache" });
     if (!res.ok) throw new Error(`failed: ${res.status}`);
     const content = await res.text();
     renderHomeChangelog(homeChangelogList, parseChangelogText(content));
